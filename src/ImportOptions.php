@@ -10,6 +10,8 @@ final readonly class ImportOptions
 {
     /**
      * @param list<string> $requiredColumns
+     * @param int $maxUncompressedBytes Лимит распакованного размера каждой XML-части XLSX (лист, sharedStrings,
+     *                                  styles): `maxFileSizeBytes` ограничивает только сжатый файл
      */
     public function __construct(
         public int $maxFileSizeBytes = 10_485_760,
@@ -19,6 +21,7 @@ final readonly class ImportOptions
         public CsvOptions $csv = new CsvOptions(),
         public SheetSelection $sheet = new SheetSelection(0),
         public ?RowValidatorInterface $rowValidator = null,
+        public int $maxUncompressedBytes = 67_108_864,
     ) {
         if ($this->maxFileSizeBytes <= 0) {
             throw new InvalidArgumentException('maxFileSizeBytes must be greater than 0.');
@@ -30,6 +33,10 @@ final readonly class ImportOptions
 
         if ($this->maxColumns <= 0) {
             throw new InvalidArgumentException('maxColumns must be greater than 0.');
+        }
+
+        if ($this->maxUncompressedBytes <= 0) {
+            throw new InvalidArgumentException('maxUncompressedBytes must be greater than 0.');
         }
     }
 }

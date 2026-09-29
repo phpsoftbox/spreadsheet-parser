@@ -6,6 +6,7 @@ namespace PhpSoftBox\SpreadsheetParser\Excel;
 
 use DateTimeImmutable;
 use DateTimeZone;
+use PhpSoftBox\SpreadsheetParser\Exception\ImportException;
 use PhpSoftBox\SpreadsheetParser\Exception\ParsingException;
 use PhpSoftBox\SpreadsheetParser\Internal\RawTable;
 use PhpSoftBox\SpreadsheetParser\SheetSelection;
@@ -14,7 +15,7 @@ use XMLReader;
 use ZipArchive;
 
 use function array_key_exists;
-use function array_keys;
+use function count;
 use function floor;
 use function implode;
 use function in_array;
@@ -38,6 +39,7 @@ use function trim;
 
 use const LIBXML_NOCDATA;
 use const LIBXML_NONET;
+use const PHP_INT_MAX;
 
 final class XlsxReader
 {
@@ -48,8 +50,21 @@ final class XlsxReader
         14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 30, 36, 45, 46, 47, 50, 57,
     ];
 
-    public function read(string $filePath, SheetSelection $selection): RawTable
-    {
+    /**
+     * Последняя колонка листа Excel (XFD): ссылки дальше неё считаются повреждённым файлом.
+     */
+    private const int MAX_COLUMN_INDEX = 16_383;
+
+    /**
+     * @param int $maxRows Сколько непустых строк прочитать; дальше лист не разбирается
+     * @param int $maxPartBytes Лимит распакованного размера каждой XML-части книги (защита от zip-бомбы)
+     */
+    public function read(
+        string $filePath,
+        SheetSelection $selection,
+        int $maxRows = PHP_INT_MAX,
+        int $maxPartBytes = PHP_INT_MAX,
+    ): RawTable {
         $zip = new ZipArchive();
 
         if ($zip->open($filePath) !== true) {
@@ -57,9 +72,9 @@ final class XlsxReader
         }
 
         try {
-            $workbookXml = $zip->getFromName('xl/workbook.xml');
-            $relsXml     = $zip->getFromName('xl/_rels/workbook.xml.rels');
-            if (!is_string($workbookXml) || !is_string($relsXml)) {
+            $workbookXml = $this->readPart($zip, 'xl/workbook.xml', $maxPartBytes);
+            $relsXml     = $this->readPart($zip, 'xl/_rels/workbook.xml.rels', $maxPartBytes);
+            if ($workbookXml === null || $relsXml === null) {
                 throw new ParsingException('XLSX workbook metadata is missing.');
             }
 
@@ -67,27 +82,55 @@ final class XlsxReader
             $relationshipMap = $this->parseWorkbookRelationships($relsXml);
             $sheetPath       = $this->resolveSheetPath($sheetMeta, $relationshipMap, $selection);
 
-            $sheetXml = $zip->getFromName($sheetPath);
-            if (!is_string($sheetXml)) {
+            $sheetXml = $this->readPart($zip, $sheetPath, $maxPartBytes);
+            if ($sheetXml === null) {
                 throw new ParsingException('Selected worksheet XML not found.');
             }
 
             $sharedStrings = [];
-            $sharedXml     = $zip->getFromName('xl/sharedStrings.xml');
-            if (is_string($sharedXml)) {
+            $sharedXml     = $this->readPart($zip, 'xl/sharedStrings.xml', $maxPartBytes);
+            if ($sharedXml !== null) {
                 $sharedStrings = $this->parseSharedStrings($sharedXml);
             }
 
             $styleIsDate = [];
-            $stylesXml   = $zip->getFromName('xl/styles.xml');
-            if (is_string($stylesXml)) {
+            $stylesXml   = $this->readPart($zip, 'xl/styles.xml', $maxPartBytes);
+            if ($stylesXml !== null) {
                 $styleIsDate = $this->parseStyleDateMap($stylesXml);
             }
 
-            return new RawTable($this->readSheetRows($sheetXml, $sharedStrings, $styleIsDate));
+            return new RawTable($this->readSheetRows($sheetXml, $sharedStrings, $styleIsDate, $maxRows));
         } finally {
             $zip->close();
         }
+    }
+
+    /**
+     * Читает часть архива не больше лимита. Размер из заголовка zip проверяется сразу, но чтение всё равно
+     * ограничено длиной: заголовку нельзя доверять, а getFromName() выделяет буфер под переданную длину.
+     */
+    private function readPart(ZipArchive $zip, string $name, int $maxBytes): ?string
+    {
+        $stat = $zip->statName($name);
+        if ($stat === false) {
+            return null;
+        }
+
+        $declaredSize = (int) $stat['size'];
+        if ($declaredSize > $maxBytes) {
+            throw new ImportException('Превышен лимит распакованного размера XLSX.');
+        }
+
+        $content = $zip->getFromName($name, $declaredSize + 1);
+        if (!is_string($content)) {
+            return null;
+        }
+
+        if (strlen($content) > $maxBytes) {
+            throw new ImportException('Превышен лимит распакованного размера XLSX.');
+        }
+
+        return $content;
     }
 
     /**
@@ -283,9 +326,9 @@ final class XlsxReader
     /**
      * @param list<string> $sharedStrings
      * @param array<int, bool> $styleIsDate
-     * @return list<list<mixed>>
+     * @return array<int, array<int, mixed>> Непустые строки по индексу строки листа (с нуля)
      */
-    private function readSheetRows(string $sheetXml, array $sharedStrings, array $styleIsDate): array
+    private function readSheetRows(string $sheetXml, array $sharedStrings, array $styleIsDate, int $maxRows): array
     {
         $reader = new XMLReader();
 
@@ -293,15 +336,22 @@ final class XlsxReader
             throw new ParsingException('Invalid worksheet XML.');
         }
 
-        $rows = [];
-        while ($reader->read()) {
+        $rows      = [];
+        $lastIndex = -1;
+        while (count($rows) < $maxRows && $reader->read()) {
             if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
                 continue;
             }
 
-            $rowXml = $reader->readOuterXML();
-            $row    = $this->parseRow($rowXml, $sharedStrings, $styleIsDate);
-            $rows[] = $row;
+            // Номер строки берётся из r: Excel не пишет пустые строки, и порядковый номер <row> сдвигал бы номера.
+            $reference = (int) $reader->getAttribute('r');
+            $index     = $reference - 1 > $lastIndex ? $reference - 1 : $lastIndex + 1;
+            $lastIndex = $index;
+
+            $row = $this->parseRow($reader->readOuterXML(), $sharedStrings, $styleIsDate);
+            if (!RawTable::isEmptyRow($row)) {
+                $rows[$index] = $row;
+            }
         }
 
         $reader->close();
@@ -312,7 +362,7 @@ final class XlsxReader
     /**
      * @param list<string> $sharedStrings
      * @param array<int, bool> $styleIsDate
-     * @return list<mixed>
+     * @return array<int, mixed> Ячейки по индексу колонки; пропущенные ячейки в массив не попадают
      */
     private function parseRow(string $rowXml, array $sharedStrings, array $styleIsDate): array
     {
@@ -330,6 +380,9 @@ final class XlsxReader
             $type       = (string) ($attributes?->t ?? '');
             $styleIndex = (int) ($attributes?->s ?? 0);
             $index      = $this->columnIndexFromReference($ref) ?? $fallbackIndex;
+            if ($index > self::MAX_COLUMN_INDEX) {
+                throw new ParsingException('Worksheet cell is beyond the last Excel column.');
+            }
 
             $mapped[$index] = $this->parseCellValue(
                 cell: $cell,
@@ -342,18 +395,9 @@ final class XlsxReader
             $fallbackIndex = max($fallbackIndex + 1, $index + 1);
         }
 
-        if ($mapped === []) {
-            return [];
-        }
-
         ksort($mapped);
-        $lastIndex = (int) max(array_keys($mapped));
-        $result    = [];
-        for ($i = 0; $i <= $lastIndex; $i++) {
-            $result[] = $mapped[$i] ?? null;
-        }
 
-        return $result;
+        return $mapped;
     }
 
     /**
@@ -420,7 +464,8 @@ final class XlsxReader
             return null;
         }
 
-        if (preg_match('/^([A-Z]+)\d+$/', $reference, $matches) !== 1) {
+        // Больше трёх букв не бывает (последняя колонка — XFD), а длинная строка переполнила бы int.
+        if (preg_match('/^([A-Z]{1,3})\d+$/', $reference, $matches) !== 1) {
             return null;
         }
 
