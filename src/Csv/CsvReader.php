@@ -26,9 +26,14 @@ use function str_starts_with;
 use function strlen;
 use function substr;
 
+use const PHP_INT_MAX;
+
 final class CsvReader
 {
-    public function read(string $filePath, CsvOptions $options): RawTable
+    /**
+     * @param int $maxRows Сколько непустых строк прочитать; остаток файла не разбирается
+     */
+    public function read(string $filePath, CsvOptions $options, int $maxRows = PHP_INT_MAX): RawTable
     {
         $encoding  = $this->resolveEncoding($filePath, $options);
         $delimiter = $this->resolveDelimiter($filePath, $options);
@@ -41,9 +46,10 @@ final class CsvReader
             $file->fseek(3);
         }
 
+        // Пустые строки не хранятся: миллионы переводов строк в пределах лимита размера не должны занимать память.
         $rows      = [];
         $rowNumber = 0;
-        while (!$file->eof()) {
+        while (count($rows) < $maxRows && !$file->eof()) {
             $row = $file->fgetcsv();
             if (!is_array($row)) {
                 continue;
@@ -63,7 +69,9 @@ final class CsvReader
                 $normalized[] = $this->convertEncoding($cell, $encoding);
             }
 
-            $rows[] = $normalized;
+            if (!RawTable::isEmptyRow($normalized)) {
+                $rows[$rowNumber - 1] = $normalized;
+            }
         }
 
         return new RawTable($rows);

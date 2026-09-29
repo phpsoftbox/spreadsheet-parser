@@ -17,6 +17,7 @@ use Psr\Log\NullLogger;
 use Throwable;
 
 use function array_fill_keys;
+use function array_key_first;
 use function count;
 use function file_put_contents;
 use function filesize;
@@ -24,16 +25,18 @@ use function is_file;
 use function is_int;
 use function is_readable;
 use function is_string;
+use function max;
+use function min;
 use function pathinfo;
 use function preg_match;
-use function random_int;
-use function rtrim;
 use function strlen;
 use function sys_get_temp_dir;
+use function tempnam;
 use function trim;
 use function unlink;
 
 use const PATHINFO_BASENAME;
+use const PHP_INT_MAX;
 
 final class SpreadsheetParser
 {
@@ -55,7 +58,7 @@ final class SpreadsheetParser
         $cleanup  = false;
 
         try {
-            $prepared = $this->prepareSource($source, $definition->driver(), $options);
+            $prepared = $this->prepareSource($source, $options);
             $filePath = $prepared['path'];
             $fileName = $prepared['file_name'];
             $cleanup  = $prepared['cleanup'];
@@ -114,7 +117,7 @@ final class SpreadsheetParser
     /**
      * @return array{path: string, file_name: string, cleanup: bool}
      */
-    private function prepareSource(ImportSource $source, ImportDriver $driver, ImportOptions $options): array
+    private function prepareSource(ImportSource $source, ImportOptions $options): array
     {
         if ($source->path !== null) {
             $this->assertFile($source->path, $options);
@@ -140,7 +143,7 @@ final class SpreadsheetParser
             throw new ImportException('Превышен лимит размера файла.');
         }
 
-        $tempPath = $this->createTempSourcePath($driver, $content);
+        $tempPath = $this->createTempSourcePath($content);
         $this->assertFile($tempPath, $options);
 
         return [
@@ -150,16 +153,19 @@ final class SpreadsheetParser
         ];
     }
 
-    private function createTempSourcePath(ImportDriver $driver, string $content): string
+    private function createTempSourcePath(string $content): string
     {
-        $tempPath = rtrim(sys_get_temp_dir(), '/\\')
-            . '/spreadsheet-parser-'
-            . random_int(1_000_000, 9_999_999)
-            . '.'
-            . $driver->value;
+        // tempnam() атомарно создаёт уникальный файл с правами 0600: предсказуемое имя в общем /tmp позволяло
+        // подменить его симлинком или прочитать чужой импорт.
+        $tempPath = tempnam(sys_get_temp_dir(), 'spreadsheet-parser-');
+        if (!is_string($tempPath)) {
+            throw new ParsingException('Cannot create temporary import file.');
+        }
 
         $written = file_put_contents($tempPath, $content);
         if (!is_int($written) || $written <= 0) {
+            @unlink($tempPath);
+
             throw new ParsingException('Cannot create temporary import file.');
         }
 
@@ -168,9 +174,17 @@ final class SpreadsheetParser
 
     private function readTableByDriver(ImportDriver $driver, string $filePath, ImportOptions $options): RawTable
     {
+        // Заголовок, maxRows строк данных и ещё одна, чтобы сработал лимит строк: остальное не читается в память.
+        $rowsToRead = min($options->maxRows, PHP_INT_MAX - 2) + 2;
+
         return match ($driver) {
-            ImportDriver::CSV  => $this->csvReader->read($filePath, $options->csv),
-            ImportDriver::XLSX => $this->xlsxReader->read($filePath, $options->sheet),
+            ImportDriver::CSV  => $this->csvReader->read($filePath, $options->csv, $rowsToRead),
+            ImportDriver::XLSX => $this->xlsxReader->read(
+                $filePath,
+                $options->sheet,
+                $rowsToRead,
+                $options->maxUncompressedBytes,
+            ),
         };
     }
 
@@ -201,27 +215,27 @@ final class SpreadsheetParser
         ImportOptions $options,
         ImportDefinitionInterface $definition,
     ): ImportResult {
-        $headerContext = $this->resolveHeadersContext(
-            table: $table,
-            allowHeaderless: $definition->allowHeaderless(),
-        );
-
-        if ($headerContext === null) {
+        $firstRowIndex = array_key_first($table->rows);
+        if ($firstRowIndex === null) {
             return new ImportResult($type, [], [], [], ['Файл пустой или не содержит данных.'], 0);
         }
 
-        $headers = $headerContext['headers'];
-        if (!$definition->allowHeaderless() && !$this->looksLikeHeaderRow($headers)) {
-            return new ImportResult($type, [], $headers, [], ['Не удалось определить строку заголовков.'], 0);
-        }
-
-        if (count($headers) > $options->maxColumns) {
+        // Ширина проверяется до построения заголовков: ячейка в дальней колонке не должна раздувать строку.
+        $firstRow = $table->rows[$firstRowIndex];
+        if ($this->rowWidth($firstRow) > $options->maxColumns) {
             $this->logger->warning('Import limit exceeded: max columns', [
-                'actual' => count($headers),
+                'actual' => $this->rowWidth($firstRow),
                 'max'    => $options->maxColumns,
             ]);
 
-            return new ImportResult($type, [], $headers, [], ['Превышен лимит количества колонок.'], 0);
+            return new ImportResult($type, [], [], [], ['Превышен лимит количества колонок.'], 0);
+        }
+
+        $headers = $definition->allowHeaderless()
+            ? $this->buildGeneratedHeaders($firstRow)
+            : $this->normalizeHeaders($firstRow);
+        if (!$definition->allowHeaderless() && !$this->looksLikeHeaderRow($headers)) {
+            return new ImportResult($type, [], $headers, [], ['Не удалось определить строку заголовков.'], 0);
         }
 
         $requiredColumnsErrors = $this->validateRequiredColumns($headers, $options->requiredColumns);
@@ -234,9 +248,8 @@ final class SpreadsheetParser
         $totalRows = 0;
 
         $headerCount = count($headers);
-        for ($i = $headerContext['data_start_index']; $i < count($table->rows); $i++) {
-            $sourceRow = $table->rows[$i];
-            if ($this->isEmptyRow($sourceRow)) {
+        foreach ($table->rows as $i => $sourceRow) {
+            if ($i === $firstRowIndex && !$definition->allowHeaderless()) {
                 continue;
             }
 
@@ -253,11 +266,11 @@ final class SpreadsheetParser
                 break;
             }
 
-            $trimmedRow = $this->trimTrailingEmptyCells($sourceRow);
-            if (count($trimmedRow) > $options->maxColumns) {
+            $rowWidth = $this->rowWidth($sourceRow);
+            if ($rowWidth > $options->maxColumns) {
                 $this->logger->warning('Import limit exceeded: row max columns', [
                     'row_number' => $lineNumber,
-                    'actual'     => count($trimmedRow),
+                    'actual'     => $rowWidth,
                     'max'        => $options->maxColumns,
                 ]);
 
@@ -301,47 +314,7 @@ final class SpreadsheetParser
     }
 
     /**
-     * @return array{headers: list<string>, data_start_index: int}|null
-     */
-    private function resolveHeadersContext(RawTable $table, bool $allowHeaderless): ?array
-    {
-        $firstDataRowIndex = null;
-        $firstDataRow      = [];
-
-        foreach ($table->rows as $index => $row) {
-            if ($this->isEmptyRow($row)) {
-                continue;
-            }
-
-            $firstDataRowIndex = $index;
-            $firstDataRow      = $row;
-            break;
-        }
-
-        if ($firstDataRowIndex === null) {
-            return null;
-        }
-
-        $normalizedHeaders = $this->normalizeHeaders($firstDataRow);
-        if ($normalizedHeaders === []) {
-            return null;
-        }
-
-        if ($allowHeaderless) {
-            return [
-                'headers'          => $this->buildGeneratedHeaders($firstDataRow),
-                'data_start_index' => $firstDataRowIndex,
-            ];
-        }
-
-        return [
-            'headers'          => $normalizedHeaders,
-            'data_start_index' => $firstDataRowIndex + 1,
-        ];
-    }
-
-    /**
-     * @param list<mixed> $row
+     * @param array<int, mixed> $row
      * @return list<string>
      */
     private function buildGeneratedHeaders(array $row): array
@@ -392,7 +365,7 @@ final class SpreadsheetParser
     }
 
     /**
-     * @param list<mixed> $row
+     * @param array<int, mixed> $row
      * @return list<string>
      */
     private function normalizeHeaders(array $row): array
@@ -436,27 +409,26 @@ final class SpreadsheetParser
     }
 
     /**
-     * @param list<mixed> $row
+     * Ширина строки — индекс последней непустой ячейки плюс один; строка может быть разреженной.
+     *
+     * @param array<int, mixed> $row
      */
-    private function isEmptyRow(array $row): bool
+    private function rowWidth(array $row): int
     {
-        foreach ($row as $value) {
-            if ($value === null) {
+        $width = 0;
+        foreach ($row as $index => $value) {
+            if ($value === null || (is_string($value) && trim($value) === '')) {
                 continue;
             }
 
-            if (is_string($value) && trim($value) === '') {
-                continue;
-            }
-
-            return false;
+            $width = max($width, $index + 1);
         }
 
-        return true;
+        return $width;
     }
 
     /**
-     * @param list<mixed> $row
+     * @param array<int, mixed> $row
      * @return list<mixed>
      */
     private function trimTrailingEmptyCells(array $row): array
